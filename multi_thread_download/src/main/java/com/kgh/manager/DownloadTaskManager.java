@@ -41,14 +41,13 @@ public class DownloadTaskManager {
     }
 
     public DownloadTask addTask(String url, String filePath, Object tag) {
-        DownloadTask task = new DownloadTask(getOkHttpClient(),url,tag);
+        DownloadTask task = new DownloadTask(getOkHttpClient(),url,filePath,tag);
         addDownloadTask(task);
-        task.startDownload(url, filePath, tag);
         return task;
     }
 
     public void addDownloadTask(DownloadTask task) {
-        if (task == null || task.getDownloadTaskBean() == null || task.getDownloadTaskBean().getTaskId() == null) {
+        if (task == null || task.getTaskId() == null) {
             return;
         }
         if (downloadTaskList == null) {

@@ -2,12 +2,12 @@ package com.kgh.manager;
 
 import android.os.Handler;
 import android.os.Looper;
+import android.util.Log;
 
 import com.kgh.bean.DownloadTaskBean;
 import com.kgh.interfaces.TaskListener;
 import com.kgh.request.RequestCallback;
 import com.kgh.request.RequestUitl;
-import com.kgh.utils.TaskDataUtil;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -34,42 +34,60 @@ import okhttp3.Response;
 
 public class DownloadTask {
     private DownloadTaskBean taskBean;
-    public final int DEFAULT_THREAD_COUNT = 2;
+    public final int DEFAULT_THREAD_COUNT = 3;//默认分块大小
     private int threadCount = DEFAULT_THREAD_COUNT;
-    private long MAX_LITMIT_SIZE_SINGLE = 1 * 1024 * 1024;
-    private long downloadProgress = 0;
-    private Handler handler;
-    private boolean isStop = false;
+    private long MAX_LITMIT_SIZE_SINGLE = 1 * 1024 * 1024;//大于此值则开始分块
+    private long[] downloadProgress ;//每块下载的大小
+    private long downloadTotle ;//下载的总大小
+    private int pro ;//下载的进度百分百
+    private Handler handler;//UI句柄，用于通知下载进度
+    private boolean isDownloading = false;
     private List<TaskListener> taskListenerList;
     private OkHttpClient okHttpClient;
 
+    public DownloadTask(OkHttpClient okHttpClient, String url, String savePath,Object tag) {
+        this(okHttpClient,url,savePath,null,tag);
+    }
 
-    public DownloadTask(OkHttpClient okHttpClient, String url, Object tag) {
+    public DownloadTask(OkHttpClient okHttpClient, String url, String savePath, String fileName,Object tag) {
         if (handler == null) {
             handler = new Handler(Looper.getMainLooper());
         }
+        if (okHttpClient == null || url == null || url.trim().equals("") || savePath == null || savePath.trim().equals("")) {
+            Log.e("tag", "DownloadTask params error");
+            return;
+        }
         this.okHttpClient = okHttpClient;
-        initTask(url, tag);
+        initTask(url, savePath,fileName, tag);
     }
 
-    public void initTask(String url, Object tag) {
+    public void initTask(String url, String savePath,String fileName, Object tag) {
         if (taskBean == null) {
             taskBean = new DownloadTaskBean();
             taskBean.setFileSize(-1);
             taskBean.setDownloadUrl(url);
             taskBean.setTag(tag);
-            Object t = tag;
-            if (t == null) {
-                t = System.nanoTime();
-            }
-            taskBean.setTaskId(url + "_" + t.toString());
-            TaskDataUtil.saveTaskData(taskBean.getTaskId(), taskBean);
+            taskBean.setSavePath(savePath);
+            taskBean.setFileName(fileName);
+            taskBean.setTaskId(url + "_" + savePath);
         }
     }
 
     public DownloadTaskBean getDownloadTaskBean() {
         return taskBean;
     }
+
+    public String getTaskId() {
+        if (taskBean != null) {
+            return taskBean.getTaskId();
+        }
+        return null;
+    }
+
+    public void start() {
+        startDownload(taskBean.getDownloadUrl(), taskBean.getFileSize(), taskBean.getSavePath(), taskBean.getFileName(), taskBean.getTag());
+    }
+
 
     public void startDownload(final String url, final String filePath, final Object tag) {
         this.startDownload(url, filePath, null, tag);
@@ -81,21 +99,18 @@ public class DownloadTask {
     }
 
     public void startDownload(final String url, long fileSize, final String filePath, final String fileName, final Object tag) {
-        downloadProgress = 0;
-        initTask(url, tag);
+        initTask(url, filePath, fileName,tag);
         taskBean.setFileSize(fileSize);
         taskBean.setDownloadUrl(url);
         taskBean.setFileName(fileName);
         taskBean.setSavePath(filePath);
-        TaskDataUtil.saveTaskData(taskBean.getTaskId(), taskBean);
-
         if (taskBean.getFileSize() > 0 && taskBean.getFileName() != null && !taskBean.getFileName().trim().equals("")) {
             download(url, taskBean.getFileSize(), taskBean.getSavePath(), taskBean.getFileName(), tag);
         } else {
             RequestUitl.getAsync(okHttpClient, url, new RequestCallback() {
                 @Override
                 public void onFailure(Call call, IOException e) {
-
+                    e.printStackTrace();
                 }
 
                 @Override
@@ -127,7 +142,7 @@ public class DownloadTask {
                                 }
                             }
                             if (fName == null || "".equals(fName.trim())) {
-                                fName = url.substring(fName.lastIndexOf("/") + 1);
+                                fName = url.substring(url.lastIndexOf("/") + 1);
                             }
                         }
                         response.body().close();
@@ -140,13 +155,12 @@ public class DownloadTask {
     }
 
     private void download(String url, long fileSize, String filePath, String fileName, Object tag) {
-        initTask(url, tag);
+        initTask(url, filePath,fileName, tag);
         taskBean.setFileSize(fileSize);
         taskBean.setDownloadUrl(url);
         taskBean.setFileName(fileName);
         taskBean.setSavePath(filePath);
-        TaskDataUtil.saveTaskData(taskBean.getTaskId(), taskBean);
-        downloadProgress = 0;
+        Log.e("tag","fileSize:"+fileSize);
         File file = new File(filePath, fileName);
         if (file.exists()) {
             handler.post(finishRunnable);
@@ -174,6 +188,7 @@ public class DownloadTask {
                 }
             }
         }
+        handler.post(startRunnable);
         //大于指定大小则开多线程下载
         if (fileSize > MAX_LITMIT_SIZE_SINGLE) {
             threadCount = DEFAULT_THREAD_COUNT;
@@ -211,8 +226,17 @@ public class DownloadTask {
                 e.printStackTrace();
                 notifyError(taskBean.getTaskId(), e);
             }
+        } else {
+            try {
+                recordFile.createNewFile();
+                tempFile = new RandomAccessFile(recordFile, "rw");// 获取前面已创建的文件.
+            } catch (Exception e) {
+                e.printStackTrace();
+                notifyError(taskBean.getTaskId(), e);
+            }
         }
-        
+
+        downloadProgress = new long[threadCount];
         //开线程下载
         for (int threadId = 0; threadId < threadCount; threadId++) {
             long startIndex = threadId * blockSize; // 线程开始下载的位置
@@ -229,9 +253,9 @@ public class DownloadTask {
                         start = startIndex;
                     }
                     if (start == endIndex) {
-                        downloadProgress += (endIndex - startIndex + 1);
+                        downloadProgress[threadId] += (endIndex - startIndex + 1);
                     } else {
-                        downloadProgress += (start - startIndex);
+                        downloadProgress[threadId] += (start - startIndex);
                         downloadThread(url, start, endIndex, threadId, downloadFile, tag);// 开启线程下载
                     }
                     notifyProgress();
@@ -241,6 +265,7 @@ public class DownloadTask {
                 }
             } else {
                 //首次下载
+                Log.e("tag"," threadId:"+threadId+" startIndex:"+startIndex+" endIndex:"+endIndex+" ");
                 downloadThread(url, startIndex, endIndex, threadId, downloadFile, tag);
             }
 
@@ -275,7 +300,6 @@ public class DownloadTask {
                             int length = 0;
                             while ((length = inputStream.read(buffer)) != -1) {
                                 output.write(buffer, 0, length);
-                                downloadProgress += length;
                                 handler.post(new Runnable() {
                                     @Override
                                     public void run() {
@@ -289,12 +313,13 @@ public class DownloadTask {
                             }
                             file.renameTo(new File(filePath, fileName));
                             output.flush();
+                            taskBean.setFileSize(file.length());
                             handler.post(new Runnable() {
                                 @Override
                                 public void run() {
                                     if (taskListenerList != null && taskListenerList.size() > 0) {
                                         for (TaskListener l : taskListenerList) {
-                                            l.notifyFinish(taskBean.getTaskId(), taskBean.getSavePath(), taskBean.getFileName());
+                                            l.notifyFinish(taskBean.getTaskId(), taskBean.getSavePath(), taskBean.getFileName(),taskBean.getFileSize());
                                         }
                                     }
                                 }
@@ -319,10 +344,11 @@ public class DownloadTask {
     }
 
     public void downloadThread(final String url, final long startIndex, final long endIndex, final int threadId, final File file, final Object tag) {
+        isDownloading = true;
         RequestUitl.downloadFileByRange(okHttpClient, url, startIndex, endIndex, new RequestCallback() {
             @Override
             public void onFailure(Call call, IOException e) {
-
+                notifyError(taskBean.getTaskId(), e);
             }
 
             @Override
@@ -344,9 +370,9 @@ public class DownloadTask {
                     byte[] buffer = new byte[1024];
                     int length = 0;
                     long progress = startIndex;
-
+                    long p = 0;
                     while ((length = is.read(buffer)) > 0) {
-                        if (isStop) {
+                        if (!isDownloading) {
                             is.close();
                             response.body().close();
                             recordAccessFile.close();
@@ -354,12 +380,16 @@ public class DownloadTask {
                             return;
                         }
                         progress += length;
+                        p += length;
                         downloadAccessFile.write(buffer, 0, length);
                         recordAccessFile.seek(threadId * 8);//long为8个字节
                         recordAccessFile.writeLong(progress - 1);
-                        downloadProgress += length;
+                        downloadProgress[threadId] += length;
                         notifyProgress();
                     }
+//                    Log.e("tag","downloadProgress:"+downloadProgress);
+                    Log.e("tag"," threadId:"+threadId+" startIndex:"+startIndex+" endIndex:"+endIndex+" "+" progress:"+progress+" "+" p:"+p);
+
                 } catch (Exception e) {
                     e.printStackTrace();
                     notifyError(taskBean.getTaskId(), e);
@@ -384,9 +414,13 @@ public class DownloadTask {
         if (taskBean == null) {
             return;
         }
-        taskBean.setDownloadedSize(downloadProgress);
-        taskBean.setProgress((int) (downloadProgress * 100 / taskBean.getFileSize()));
-        if (downloadProgress == taskBean.getFileSize()) {
+        downloadTotle = 0l;
+        for (long p : downloadProgress){
+            downloadTotle += p;
+        }
+        taskBean.setDownloadedSize(downloadTotle);
+        taskBean.setProgress((int) (downloadTotle * 100 / taskBean.getFileSize()));
+        if (downloadTotle == taskBean.getFileSize()) {
             //下载完后重命名
             File file = new File(taskBean.getSavePath(), taskBean.getFileName() + ".tmp");
             file.renameTo(new File(taskBean.getSavePath(), taskBean.getFileName()));
@@ -398,15 +432,30 @@ public class DownloadTask {
             handler.post(finishRunnable);
         } else {
             handler.post(progressRunnable);
+            if (taskListenerList != null && taskListenerList.size() > 0) {
+                int correntProgress = (int) (downloadTotle * 100 / taskBean.getFileSize());
+                if(correntProgress != pro){
+                    pro = correntProgress;
+                    for (TaskListener l : taskListenerList) {
+                        l.notifyProgressInBackThread(taskBean.getTaskId(),pro , taskBean.getDownloadedSize(), taskBean.getFileSize());
+                    }
+                }
+            }
         }
     }
 
     private Runnable progressRunnable = new Runnable() {
+
         @Override
         public void run() {
+            isDownloading = true;
             if (taskListenerList != null && taskListenerList.size() > 0) {
-                for (TaskListener l : taskListenerList) {
-                    l.notifyProgress(taskBean.getTaskId(), (int) (downloadProgress * 100 / taskBean.getFileSize()), taskBean.getDownloadedSize(), taskBean.getFileSize());
+                int correntProgress = (int) (downloadTotle * 100 / taskBean.getFileSize());
+                if(correntProgress != pro){
+                    pro = correntProgress;
+                    for (TaskListener l : taskListenerList) {
+                        l.notifyProgressInBackThread(taskBean.getTaskId(),pro , taskBean.getDownloadedSize(), taskBean.getFileSize());
+                    }
                 }
             }
         }
@@ -415,15 +464,29 @@ public class DownloadTask {
     private Runnable finishRunnable = new Runnable() {
         @Override
         public void run() {
+            isDownloading = false;
             if (taskListenerList != null && taskListenerList.size() > 0) {
                 for (TaskListener l : taskListenerList) {
-                    l.notifyFinish(taskBean.getTaskId(), taskBean.getSavePath(), taskBean.getFileName());
+                    l.notifyFinish(taskBean.getTaskId(), taskBean.getSavePath(), taskBean.getFileName(), taskBean.getFileSize());
+                }
+            }
+        }
+    };
+
+    private Runnable startRunnable = new Runnable() {
+        @Override
+        public void run() {
+            isDownloading = true;
+            if (taskListenerList != null && taskListenerList.size() > 0) {
+                for (TaskListener l : taskListenerList) {
+                    l.notifyStart(taskBean.getTaskId(), taskBean.getSavePath(), taskBean.getFileName(), taskBean.getFileSize(), taskBean.getDownloadedSize(), taskBean.getProgress());
                 }
             }
         }
     };
 
     public void notifyError(final String taskId, final Exception e) {
+        isDownloading = false;
         handler.post(new Runnable() {
             @Override
             public void run() {
@@ -437,8 +500,8 @@ public class DownloadTask {
     }
 
     public void restart() {
-        if (isStop) {
-            isStop = false;
+        if (!isDownloading) {
+            isDownloading = true;
             if (taskBean == null) {
                 return;
             }
@@ -447,11 +510,11 @@ public class DownloadTask {
     }
 
     public void stop() {
-        isStop = true;
+        isDownloading = false;
     }
 
     public void cancel() {
-        isStop = true;
+        isDownloading = false;
         File file = new File(taskBean.getSavePath(), taskBean.getFileName());
         File downloadTmpFile = new File(taskBean.getSavePath(), taskBean.getFileName() + ".tmp");
         File recordFile = new File(taskBean.getSavePath(), taskBean.getFileName() + ".tmp.dlntmp");
@@ -464,7 +527,6 @@ public class DownloadTask {
         if (file.exists()) {
             file.delete();
         }
-        TaskDataUtil.cleanTaskData(taskBean.getTaskId());
     }
 
     public void registerTaskListener(TaskListener listener) {
